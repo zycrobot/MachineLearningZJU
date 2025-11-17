@@ -1,0 +1,166 @@
+#利用VLM实现物体质量和尺寸的估计,从图片中获取物理信息
+
+import cv2
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from transformers import AutoProcessor, AutoModelForCausalLM
+import torch.nn.functional as F
+
+# -----------------------------
+# Step 0: 配置参数
+# -----------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+IMAGE_PATH = "pic.png"
+
+# 已知参照物信息
+REFERENCE_OBJECT = "credit card"
+REFERENCE_WIDTH_CM = 8.56  
+
+# 目标物体类别（ VLM 自动识别）
+TARGET_OBJECT = "phone" 
+
+# -----------------------------
+# Step 1: 加载图像
+# -----------------------------
+image_bgr = cv2.imread(IMAGE_PATH)
+image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+H, W = image_rgb.shape[:2]
+
+# -----------------------------
+# Step 2: 使用 Qwen-VL 获取物体边界框（grounding）
+# -----------------------------
+print("Loading Qwen-VL...")
+
+processor = AutoProcessor.from_pretrained("Qwen/Qwen-VL-Chat", trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen-VL-Chat",
+    device_map="auto",
+    trust_remote_code=True,
+    fp16=True
+).eval()
+
+def get_bbox_from_vlm(image, query):
+    """
+    使用 Qwen-VL 的 grounding 能力获取物体边界框
+    返回 [x1, y1, x2, y2] 归一化坐标 (0~1)
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"image": image},
+                {"text": f"Locate the {query} in the image. Return the bounding box as [x1, y1, x2, y2] normalized to [0,1]."}
+            ]
+        }
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[image], return_tensors="pt").to(DEVICE)
+
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, max_new_tokens=128)
+
+    generated_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+    print(f"VLM response for '{query}':", generated_text)
+
+    # 尝试解析 [x1, y1, x2, y2]
+    try:
+        # 
+        start = generated_text.find('[')
+        end = generated_text.find(']') + 1
+        bbox_str = generated_text[start:end]
+        bbox_norm = eval(bbox_str)
+        if len(bbox_norm) == 4 and all(0 <= x <= 1 for x in bbox_norm):
+            return [float(x) for x in bbox_norm]
+    except Exception as e:
+        print(f"Failed to parse bbox for {query}: {e}")
+        return None
+
+# 获取参照物和目标物体的 bbox
+ref_bbox_norm = get_bbox_from_vlm(image_rgb, REFERENCE_OBJECT)
+target_bbox_norm = get_bbox_from_vlm(image_rgb, TARGET_OBJECT)
+
+if ref_bbox_norm is None or target_bbox_norm is None:
+    raise ValueError("Failed to detect reference or target object.")
+
+# 转为像素坐标
+def denorm_bbox(bbox_norm, W, H):
+    x1, y1, x2, y2 = bbox_norm
+    return [int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H)]
+
+ref_bbox = denorm_bbox(ref_bbox_norm, W, H)
+target_bbox = denorm_bbox(target_bbox_norm, W, H)
+
+# 可视化 bbox（可选）
+vis_img = image_rgb.copy()
+cv2.rectangle(vis_img, (ref_bbox[0], ref_bbox[1]), (ref_bbox[2], ref_bbox[3]), (0, 255, 0), 2)
+cv2.rectangle(vis_img, (target_bbox[0], target_bbox[1]), (target_bbox[2], target_bbox[3]), (255, 0, 0), 2)
+cv2.putText(vis_img, "Reference", (ref_bbox[0], ref_bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+cv2.putText(vis_img, "Target", (target_bbox[0], target_bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+plt.imshow(vis_img)
+plt.title("Detected Objects")
+plt.axis("off")
+plt.savefig("detected_objects.png")
+plt.show()
+
+# -----------------------------
+# Step 3: 使用 MiDaS 估计深度图
+# -----------------------------
+print("Loading MiDaS...")
+midas = torch.hub.load("intel-isl/MiDaS", "DPT_Large").to(DEVICE).eval()
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+transform = midas_transforms.dpt_transform
+
+input_batch = transform(image_rgb).to(DEVICE)
+
+with torch.no_grad():
+    depth_pred = midas(input_batch)
+    depth_pred = F.interpolate(
+        depth_pred.unsqueeze(1),
+        size=(H, W),
+        mode="bicubic",
+        align_corners=False,
+    ).squeeze().cpu().numpy()
+
+# 归一化深度图用于可视化
+depth_vis = (depth_pred - depth_pred.min()) / (depth_pred.max() - depth_pred.min())
+plt.imshow(depth_vis, cmap='plasma')
+plt.axis('off')
+plt.title("Depth Map")
+plt.savefig("depth_map.png")
+plt.show()
+
+# -----------------------------
+# Step 4: 计算平均深度 & 物理尺寸
+# -----------------------------
+
+def get_mean_depth(depth_map, bbox):
+    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(depth_map.shape[1], x2), min(depth_map.shape[0], y2)
+    if x2 <= x1 or y2 <= y1:
+        return 1.0  # fallback
+    return np.mean(depth_map[y1:y2, x1:x2])
+
+ref_depth = get_mean_depth(depth_pred, ref_bbox)
+target_depth = get_mean_depth(depth_pred, target_bbox)
+
+# 参照物在图像中的像素宽度
+ref_pixel_width = ref_bbox[2] - ref_bbox[0]
+target_pixel_width = target_bbox[2] - target_bbox[0]
+target_pixel_height = target_bbox[3] - target_bbox[1]
+
+# 假设针孔相机模型：物理尺寸 = (像素尺寸 * 实际深度 * 真实参照物尺寸) / (参照物像素尺寸 * 参照物深度)
+# 推导：scale = (REF_WIDTH_CM / ref_pixel_width) * (ref_depth / Z0)，但 Z0 未知 → 利用比例消去焦距
+# 更稳健做法：计算“每像素对应的实际尺寸”在参照物处的值
+
+pixel_to_cm_at_ref = REFERENCE_WIDTH_CM / ref_pixel_width  # 每像素多少厘米（在参照物距离处）
+
+# 由于目标物体可能在不同深度，需按深度比例缩放
+# 物理尺寸 ∝ 深度（越远，同样像素代表更大物理尺寸）
+scale_factor = target_depth / ref_depth
+target_width_cm = target_pixel_width * pixel_to_cm_at_ref * scale_factor
+target_height_cm = target_pixel_height * pixel_to_cm_at_ref * scale_factor
+
+print(f"\n✅ Estimated size of '{TARGET_OBJECT}':")
+print(f"Width:  {target_width_cm:.2f} cm")
+print(f"Height: {target_height_cm:.2f} cm")
